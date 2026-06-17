@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+
+  # ── Lint & type check ──────────────────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install linting tools
+        run: pip install ruff==0.5.1 mypy==1.10.1 pydantic==2.7.4
+
+      - name: Ruff lint
+        run: ruff check . --output-format=github
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Mypy type check
+        run: mypy pipeline/ app/api/ --ignore-missing-imports --strict-optional
+
+  # ── Unit tests ────────────────────────────────────────────────────────────
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          pip install \
+            pytest==8.2.2 \
+            pytest-asyncio==0.23.7 \
+            pytest-cov==5.0.0 \
+            pydantic==2.7.4 \
+            fastapi==0.111.1 \
+            httpx==0.27.2
+
+      - name: Run tests
+        run: |
+          pytest tests/ -v \
+            --cov=pipeline \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing
+        env:
+          OPENAI_API_KEY: sk-test-dummy-not-real
+          GCP_PROJECT: test-project
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  # ── Docker builds ──────────────────────────────────────────────────────────
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.api
+          push: false
+          tags: rag-financial-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build UI image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.ui
+          push: false
+          tags: rag-financial-ui:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── dbt compile (syntax/reference check, no DB connection) ────────────────
+  dbt-validate:
+    name: dbt Compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dbt-core (no adapter — compile-only)
+        run: pip install dbt-core==1.8.3
+
+      - name: dbt deps
+        working-directory: dbt_project
+        run: dbt deps --profiles-dir .
+        env:
+          GCP_PROJECT: ci-placeholder
+
+      - name: dbt compile
+        working-directory: dbt_project
+        run: dbt compile --profiles-dir . --target dev
+        env:
+          GCP_PROJECT: ci-placeholder
+          GOOGLE_APPLICATION_CREDENTIALS: /dev/null

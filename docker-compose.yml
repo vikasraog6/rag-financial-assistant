@@ -1,0 +1,100 @@
+version: "3.9"
+
+# ── Shared environment variables ─────────────────────────────────────────────
+x-backend-env: &backend-env
+  OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY is required}
+  GCP_PROJECT: ${GCP_PROJECT:?GCP_PROJECT is required}
+  GOOGLE_APPLICATION_CREDENTIALS: /secrets/gcp-sa.json
+  CHROMA_HOST: chromadb
+  CHROMA_PORT: 8000
+  BQ_DATASET: ${BQ_DATASET:-marts}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+
+  # ── ChromaDB ──────────────────────────────────────────────────────────────
+  chromadb:
+    image: chromadb/chroma:0.5.3
+    container_name: rag_chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+      CHROMA_SERVER_AUTH_CREDENTIALS_PROVIDER: ""
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── FastAPI backend ───────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: rag_api
+    ports:
+      - "8001:8000"
+    environment:
+      <<: *backend-env
+      CORS_ORIGINS: http://localhost:8501
+      RETRIEVAL_K: ${RETRIEVAL_K:-6}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.1}
+    volumes:
+      - ${GCP_SA_KEY_PATH:-./secrets/gcp-sa.json}:/secrets/gcp-sa.json:ro
+    depends_on:
+      chromadb:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import httpx; httpx.get('http://localhost:8000/health', timeout=5).raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Streamlit UI ──────────────────────────────────────────────────────────
+  ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ui
+    container_name: rag_ui
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Embedding pipeline (run-once; trigger via --profile embed) ────────────
+  embedder:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: rag_embedder
+    command:
+      - python
+      - -m
+      - pipeline.embedder
+    environment:
+      <<: *backend-env
+    volumes:
+      - ${GCP_SA_KEY_PATH:-./secrets/gcp-sa.json}:/secrets/gcp-sa.json:ro
+    depends_on:
+      chromadb:
+        condition: service_healthy
+    profiles:
+      - embed
+    restart: "no"
+
+volumes:
+  chroma_data:
+    driver: local

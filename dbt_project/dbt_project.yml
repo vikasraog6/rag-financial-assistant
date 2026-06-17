@@ -1,0 +1,46 @@
+name: rag_financial
+version: "1.0.0"
+config-version: 2
+
+profile: rag_financial
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  rag_financial:
+    staging:
+      +schema: staging
+      +materialized: incremental
+      +tags: ["staging", "finance"]
+      +docs:
+        node_color: "#1565C0"
+    marts:
+      +schema: marts
+      +materialized: table
+      +tags: ["mart", "finance", "rag-source"]
+      +docs:
+        node_color: "#2E7D32"
+
+vars:
+  start_date: "2020-01-01"
+  tickers:
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - META
+    - TSLA
+    - NVDA
+    - JPM
+    - V
+    - JNJ

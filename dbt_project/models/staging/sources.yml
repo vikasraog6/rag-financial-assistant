@@ -1,0 +1,39 @@
+version: 2
+
+sources:
+  - name: raw
+    database: "{{ env_var('GCP_PROJECT') }}"
+    schema: raw
+    description: >
+      Raw OHLCV stock data landed from S3 via a BigQuery external table
+      or the BigQuery Data Transfer Service.
+    tables:
+      - name: stock_prices
+        description: "One row per ticker per trading day, as ingested by the Airflow DAG."
+        columns:
+          - name: ticker
+            description: "Equity ticker symbol."
+            tests:
+              - not_null
+              - accepted_values:
+                  values: [AAPL, MSFT, GOOGL, AMZN, META, TSLA, NVDA, JPM, V, JNJ]
+
+          - name: datetime
+            description: "Trading session datetime in ISO-8601."
+            tests:
+              - not_null
+
+          - name: open
+            tests: [not_null]
+          - name: high
+            tests: [not_null]
+          - name: low
+            tests: [not_null]
+          - name: close
+            tests: [not_null]
+          - name: volume
+            tests: [not_null]
+
+          - name: ingested_at
+            description: "UTC timestamp of when the Airflow task wrote this row."
+            tests: [not_null]
