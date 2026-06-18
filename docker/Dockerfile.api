@@ -1,57 +1,25 @@
-# ── Stage 1: dependency builder ───────────────────────────────────────────────
-FROM python:3.11-slim AS builder
-
-ENV PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
-WORKDIR /build
-
-# Install only production API + pipeline dependencies.
-# Pinned at the top level; sub-deps resolved by pip at build time.
-RUN pip install --prefix=/install \
-    "fastapi==0.111.1" \
-    "uvicorn[standard]==0.30.3" \
-    "pydantic==2.7.4" \
-    "pydantic-settings==2.3.4" \
-    "httpx==0.27.2" \
-    "langchain==0.2.16" \
-    "langchain-openai==0.1.23" \
-    "langchain-community==0.2.16" \
-    "langchain-core==0.2.40" \
-    "openai==1.40.0" \
-    "tiktoken==0.7.0" \
-    "chromadb==0.5.3" \
-    "google-cloud-bigquery==3.25.0" \
-    "google-cloud-bigquery-storage==2.25.0" \
-    "db-dtypes==1.3.0"
-
-
-# ── Stage 2: lean runtime ─────────────────────────────────────────────────────
-FROM python:3.11-slim AS runtime
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY --from=builder /install /usr/local
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
-# Copy application source (no Airflow/dbt code needed at runtime).
+RUN pip install --no-cache-dir \
+    fastapi uvicorn pydantic python-dotenv \
+    langchain==0.2.14 \
+    langchain-core \
+    langchain-chroma \
+    langchain-groq \
+    langchain-huggingface \
+    langchain-community \
+    chromadb \
+    sentence-transformers \
+    google-cloud-bigquery \
+    yfinance pandas
+
 COPY pipeline/ ./pipeline/
-COPY app/api/  ./app/api/
-COPY app/__init__.py ./app/__init__.py
+COPY app/ ./app/
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=8s --start-period=20s --retries=3 \
-    CMD python -c "import httpx; httpx.get('http://localhost:8000/health', timeout=5).raise_for_status()"
-
-# Two Uvicorn workers — suitable for a single-container deploy.
-# Scale via replicas in docker-compose / k8s, not --workers.
-CMD ["uvicorn", "app.api.main:app", \
-     "--host", "0.0.0.0", \
-     "--port", "8000", \
-     "--workers", "2", \
-     "--log-level", "info", \
-     "--access-log"]
+CMD ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

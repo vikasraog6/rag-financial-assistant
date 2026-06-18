@@ -1,143 +1,96 @@
-"""
-RAG chain: ChromaDB retrieval + GPT-4o-mini generation.
-
-The chain is lazily initialised on first use and cached for the process
-lifetime so FastAPI workers don't rebuild it on every request.
-"""
-
-from __future__ import annotations
-
 import logging
 import os
-from functools import lru_cache
-from typing import Any
-
-import chromadb
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_community.vectorstores import Chroma
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import Runnable
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
 
 logger = logging.getLogger(__name__)
 
-# ── Config ─────────────────────────────────────────────────────────────────
-EMBED_MODEL = "text-embedding-3-small"
-CHAT_MODEL = "gpt-4o-mini"
+CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIR", "./data/chroma_db")
 COLLECTION_NAME = "stock_data"
-CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
-CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
-RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", "6"))
-TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
 
-SYSTEM_PROMPT = """\
-You are a senior financial analyst assistant specialising in US equity markets.
-Answer ONLY from the stock data in the context below. Always cite specific
-figures (prices, dates, percentages, ticker symbols). If the data is
-insufficient to answer confidently, say so — never speculate.
+FINANCIAL_QA_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template="""You are a financial data analyst assistant with access to real market data.
+Use ONLY the context below to answer the question. Be specific with numbers and metrics.
+If the data does not contain enough information, say so clearly.
 
+Context from financial database:
 {context}
-"""
+
+Question: {question}
+
+Answer (be concise, use specific numbers from the data):""",
+)
 
 
-@lru_cache(maxsize=1)
-def _vectorstore() -> Chroma:
-    """Lazy-init the ChromaDB vectorstore, cached for process lifetime."""
-    client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-    logger.info("Connecting to ChromaDB at %s:%s", CHROMA_HOST, CHROMA_PORT)
-    return Chroma(
-        client=client,
-        collection_name=COLLECTION_NAME,
-        embedding_function=OpenAIEmbeddings(model=EMBED_MODEL),
-    )
-
-
-@lru_cache(maxsize=1)
-def build_chain() -> Runnable:
-    """
-    Construct the retrieval-augmented generation chain.
-
-    Uses Maximum Marginal Relevance (MMR) retrieval for result diversity:
-    fetches `fetch_k` candidates and re-ranks to `k` by balancing relevance
-    against redundancy.
-    """
-    vs = _vectorstore()
-    retriever = vs.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": RETRIEVAL_K, "fetch_k": RETRIEVAL_K * 3},
-    )
-
-    llm = ChatOpenAI(model=CHAT_MODEL, temperature=TEMPERATURE, streaming=True)
-    prompt = ChatPromptTemplate.from_messages(
-        [("system", SYSTEM_PROMPT), ("human", "{input}")]
-    )
-    combine_docs_chain = create_stuff_documents_chain(llm, prompt)
-    chain = create_retrieval_chain(retriever, combine_docs_chain)
-
-    logger.info(
-        "RAG chain ready — model=%s embed=%s k=%d", CHAT_MODEL, EMBED_MODEL, RETRIEVAL_K
-    )
-    return chain
-
-
-def _make_filter(ticker_filter: list[str]) -> dict[str, Any]:
-    """Build a ChromaDB $in metadata filter from a list of tickers."""
-    if len(ticker_filter) == 1:
-        return {"ticker": ticker_filter[0]}
-    return {"ticker": {"$in": ticker_filter}}
-
-
-def query(
-    question: str,
-    ticker_filter: list[str] | None = None,
-) -> dict[str, Any]:
-    """
-    Run a RAG query against the financial vector store.
-
-    Args:
-        question:      Natural language question from the user.
-        ticker_filter: Restrict context retrieval to these tickers.
-
-    Returns:
-        ``{"answer": str, "sources": list[dict]}``
-    """
-    if ticker_filter:
-        # Build a fresh retriever with the metadata filter applied at query time.
-        vs = _vectorstore()
-        retriever = vs.as_retriever(
-            search_type="mmr",
-            search_kwargs={
-                "k": RETRIEVAL_K,
-                "fetch_k": RETRIEVAL_K * 3,
-                "filter": _make_filter(ticker_filter),
-            },
+class FinancialRAGChain:
+    def __init__(self):
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name='all-MiniLM-L6-v2'
         )
-        llm = ChatOpenAI(model=CHAT_MODEL, temperature=TEMPERATURE)
-        prompt = ChatPromptTemplate.from_messages(
-            [("system", SYSTEM_PROMPT), ("human", "{input}")]
+        self.llm = ChatGroq(
+            model="llama3-8b-8192",
+            temperature=0,
+            api_key=os.getenv("GROQ_API_KEY"),
         )
-        chain = create_retrieval_chain(
-            retriever, create_stuff_documents_chain(llm, prompt)
+        self.vectorstore = None
+        self.chain = None
+        self._load_vectorstore()
+
+    def _load_vectorstore(self):
+        self.vectorstore = Chroma(
+            collection_name=COLLECTION_NAME,
+            embedding_function=self.embeddings,
+            persist_directory=CHROMA_DIR,
         )
-    else:
-        chain = build_chain()
+        count = self.vectorstore._collection.count()
+        logger.info(f"ChromaDB loaded: {count} documents")
 
-    result = chain.invoke({"input": question})
+    def _build_chain(self):
+        retriever = self.vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 5},
+        )
+        self.chain = RetrievalQA.from_chain_type(
+            llm=self.llm,
+            chain_type="stuff",
+            retriever=retriever,
+            chain_type_kwargs={"prompt": FINANCIAL_QA_PROMPT},
+            return_source_documents=True,
+        )
+        logger.info("RAG chain ready")
 
-    sources = [
-        {
-            "ticker": doc.metadata.get("ticker", ""),
-            "trade_date": doc.metadata.get("trade_date", ""),
-            "trend_signal": doc.metadata.get("trend_signal", ""),
-            "volatility_bucket": doc.metadata.get("volatility_bucket", ""),
-            "snippet": doc.page_content[:250],
-        }
-        for doc in result.get("context", [])
-    ]
+    def query(self, question: str) -> dict:
+        if self.chain is None:
+            self._build_chain()
+        try:
+            result = self.chain.invoke({"query": question})
+            sources = [
+                doc.metadata.get("ticker", "unknown")
+                for doc in result.get("source_documents", [])
+            ]
+            return {
+                "answer": result["result"],
+                "sources": list(set(sources)),
+                "num_docs_retrieved": len(result.get("source_documents", [])),
+            }
+        except Exception as e:
+            logger.error(f"Query failed: {e}")
+            return {
+                "answer": f"Error: {str(e)}",
+                "sources": [],
+                "num_docs_retrieved": 0,
+            }
 
-    logger.info(
-        "Query complete — sources=%d ticker_filter=%s question=%r",
-        len(sources), ticker_filter, question[:80],
-    )
-    return {"answer": result["answer"], "sources": sources}
+
+_rag_chain_instance = None
+
+
+def get_rag_chain() -> FinancialRAGChain:
+    global _rag_chain_instance
+    if _rag_chain_instance is None:
+        _rag_chain_instance = FinancialRAGChain()
+    return _rag_chain_instance
